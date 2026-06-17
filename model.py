@@ -1,106 +1,3 @@
-# import torch
-# from transformers import AutoTokenizer, AutoModelForSequenceClassification
-# import json
-
-# model_path = r"C:\Users\mamdo\OneDrive\Documents\grad\model_only"
-
-# tokenizer = AutoTokenizer.from_pretrained(model_path)
-# model = AutoModelForSequenceClassification.from_pretrained(model_path)
-
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# model.to(device)
-# model.eval()
-
-# try:
-#     with open(f"{model_path}/id2label.json") as f:
-#         id2label = json.load(f)
-# except:
-#     id2label = {str(i): f"Class {i}" for i in range(model.config.num_labels)}
-
-
-# def _get_probs(text: str):
-#     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-#     if "token_type_ids" in inputs:
-#         inputs.pop("token_type_ids")
-#     inputs = {k: v.to(device) for k, v in inputs.items()}
-#     with torch.no_grad():
-#         outputs = model(**inputs)
-#     probs = torch.nn.functional.softmax(outputs.logits, dim=1)[0]
-#     return probs
-
-
-# def predict(text: str):
-#     """Returns (label, confidence) for the top prediction. Backwards compatible."""
-#     probs = _get_probs(text)
-#     pred_id = torch.argmax(probs).item()
-#     return id2label[str(pred_id)], float(probs[pred_id])
-
-
-# def predict_topk(text: str, k: int = None):
-#     """
-#     Returns all symptoms sorted by confidence descending.
-#     If k is given, returns only the top-k.
-#     Each item: {"rank": int, "label": str, "score": float}
-#     """
-#     probs = _get_probs(text)
-#     sorted_ids = torch.argsort(probs, descending=True)
-
-#     if k is not None:
-#         sorted_ids = sorted_ids[:k]
-
-#     results = []
-#     for rank, idx in enumerate(sorted_ids, 1):
-#         score = float(probs[idx])
-#         if rank > 1 and score < 0.001:
-#             break
-#         results.append({
-#             "rank":  rank,
-#             "label": id2label[str(idx.item())],
-#             "score": score,
-#         })
-
-#     return results
-
-
-# def debug(text: str):
-#     """
-#     Run from terminal to diagnose prediction issues:
-#         python -c "from model import debug; debug('I have a headache')"
-#     """
-#     inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=128)
-#     if "token_type_ids" in inputs:
-#         inputs.pop("token_type_ids")
-#     inputs = {k: v.to(device) for k, v in inputs.items()}
-
-#     with torch.no_grad():
-#         outputs = model(**inputs)
-
-#     logits = outputs.logits[0]
-#     probs  = torch.nn.functional.softmax(logits, dim=0)
-
-#     print(f"\n── Input ──────────────────────────────")
-#     print(f"  Text: '{text}'")
-#     print(f"\n── Logits (raw) ───────────────────────")
-#     print(f"  min={logits.min():.4f}  max={logits.max():.4f}  std={logits.std():.4f}")
-
-#     print(f"\n── Top 10 predictions ─────────────────")
-#     top_ids = torch.argsort(probs, descending=True)[:10]
-#     for rank, idx in enumerate(top_ids, 1):
-#         i = idx.item()
-#         label = id2label.get(str(i), f"[MISSING id {i}]")
-#         print(f"  {rank:>2}. {label:<40s}  {probs[i]*100:6.2f}%")
-
-#     print(f"\n── id2label check ─────────────────────")
-#     print(f"  id2label entries : {len(id2label)}")
-#     print(f"  model num_labels : {model.config.num_labels}")
-#     missing = [str(i) for i in range(model.config.num_labels) if str(i) not in id2label]
-#     if missing:
-#         print(f"  ⚠️  Missing keys in id2label: {missing[:10]}")
-#     else:
-#         print(f"  ✅ All label IDs present in id2label.json")
-#     print()
-
-
 """
 model.py — SehaTrack Pro
 Unified inference engine:
@@ -209,25 +106,39 @@ def _load_nlp():
         return None, None
 
 
-_tokenizer, _nlp_model = _load_nlp()
+# Lazy singleton — the NLP model is only loaded into memory the first time
+# a prediction is actually requested, instead of at import time. This keeps
+# it from competing with the Whisper / CheXNet / Kvasir models for memory
+# the moment the app process starts (before anyone has even logged in).
+_tokenizer = None
+_nlp_model = None
+
+
+def _get_nlp():
+    global _tokenizer, _nlp_model
+    if _nlp_model is None and _tokenizer is None:
+        _tokenizer, _nlp_model = _load_nlp()
+    return _tokenizer, _nlp_model
 
 
 def _get_probs(text: str) -> torch.Tensor:
-    inputs = _tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+    tok, mdl = _get_nlp()
+    inputs = tok(text, return_tensors="pt", truncation=True, max_length=512)
     inputs.pop("token_type_ids", None)
     inputs = {k: v.to(device) for k, v in inputs.items()}
     with torch.no_grad():
-        logits = _nlp_model(**inputs).logits
+        logits = mdl(**inputs).logits
     return F.softmax(logits, dim=1)[0]
 
 
 def predict(text: str) -> Tuple[str, float]:
     """Return (top_label, confidence) — backwards-compatible with original app.py."""
-    if _nlp_model is None or not text.strip():
+    tok, mdl = _get_nlp()
+    if mdl is None or not text.strip():
         return "Unknown Symptom", 0.0
     probs   = _get_probs(text)
     pred_id = torch.argmax(probs).item()
-    label   = _nlp_model.config.id2label.get(pred_id, f"Class {pred_id}")
+    label   = mdl.config.id2label.get(pred_id, f"Class {pred_id}")
     return str(label), float(probs[pred_id])
 
 
@@ -237,7 +148,8 @@ def predict_topk(text: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
     If k is given, return only top-k.
     Each item: {"rank": int, "label": str, "score": float}
     """
-    if _nlp_model is None or not text.strip():
+    tok, mdl = _get_nlp()
+    if mdl is None or not text.strip():
         return [{"rank": 1, "label": "Unknown Symptom", "score": 0.0}]
 
     probs      = _get_probs(text)
@@ -252,7 +164,7 @@ def predict_topk(text: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
             break
         results.append({
             "rank":  rank,
-            "label": str(_nlp_model.config.id2label.get(idx.item(), f"Class {idx.item()}")),
+            "label": str(mdl.config.id2label.get(idx.item(), f"Class {idx.item()}")),
             "score": score,
         })
     return results
@@ -260,7 +172,8 @@ def predict_topk(text: str, k: Optional[int] = None) -> List[Dict[str, Any]]:
 
 def debug_nlp(text: str) -> None:
     """CLI helper: python -c "from model import debug_nlp; debug_nlp('I have a headache')" """
-    if _nlp_model is None:
+    tok, mdl = _get_nlp()
+    if mdl is None:
         print("NLP model not loaded.")
         return
     probs   = _get_probs(text)
@@ -269,7 +182,7 @@ def debug_nlp(text: str) -> None:
     print(f"── Top 10 predictions ─────────────────")
     for rank, idx in enumerate(top_ids, 1):
         i     = idx.item()
-        label = _nlp_model.config.id2label.get(i, f"[MISSING {i}]")
+        label = mdl.config.id2label.get(i, f"[MISSING {i}]")
         print(f"  {rank:>2}. {label:<40s}  {probs[i]*100:6.2f}%")
     print()
 
