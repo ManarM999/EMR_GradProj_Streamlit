@@ -202,24 +202,14 @@ def debug_nlp(text: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # ② CHEXNET MULTIMODAL X-RAY ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-def encode_meta(age: Any, gender: Any, view_pos: Any) -> torch.Tensor:
-    """Encode patient metadata into a 3-value tensor for the CheXNet meta branch."""
-    try:
-        a = max(0.0, min(float(age), 120.0)) / 120.0
-    except Exception:
-        a = 0.0
-    g = 1.0 if str(gender).lower().strip() == "female" else 0.0
-    v = 1.0 if "ap" in str(view_pos).lower() else 0.0
-    return torch.tensor([[a, g, v]], dtype=torch.float32)
-
-
 class CheXNetMultimodal(nn.Module):
     def __init__(self, num_classes: int = 14, meta_dim: int = 3, dropout_rate: float = 0.4):
         super().__init__()
-        base            = densenet121(weights=None)
-        self.features   = base.features
-        self.avgpool    = nn.AdaptiveAvgPool2d((1, 1))
-        dense_out       = base.classifier.in_features
+        base          = densenet121(weights=None)
+        self.features = base.features
+        self.avgpool  = nn.AdaptiveAvgPool2d((1, 1))
+        dense_out     = base.classifier.in_features
+
 
         self.meta_branch = nn.Sequential(
             nn.Linear(meta_dim, 32), nn.ReLU(inplace=True),
@@ -227,21 +217,17 @@ class CheXNetMultimodal(nn.Module):
             nn.Linear(32, 16), nn.ReLU(inplace=True),
         )
 
-        fusion = dense_out + 16
         self.classifier = nn.Sequential(
-            nn.BatchNorm1d(fusion),
-            nn.Dropout(dropout_rate),
-            nn.Linear(fusion, 512), nn.ReLU(inplace=True),
-            nn.Dropout(dropout_rate / 2),
-            nn.Linear(512, num_classes),
+            nn.Linear(dense_out, num_classes),
         )
 
     def forward(self, img: torch.Tensor, meta: torch.Tensor) -> torch.Tensor:
         feats = F.relu(self.features(img), inplace=False)
         x     = torch.flatten(self.avgpool(feats), 1)
-        return self.classifier(torch.cat([x, self.meta_branch(meta)], dim=1))
-
-
+        return self.classifier(x)
+    
+    
+    
 def _resolve_vision_weights() -> Optional[str]:
     """Use the local file if present; otherwise download it from the
     Hugging Face Hub repo on first use (it isn't checked into git)."""
@@ -266,7 +252,7 @@ def load_vision_engine() -> CheXNetMultimodal:
             state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
             if isinstance(state, dict):
                 clean = {
-                    k.replace("module.", "").replace("base_model.", ""): v
+                    k.replace("module.", "").replace("base_model.", "").replace("model.", ""): v
                     for k, v in state.items()
                 }
                 result = model.load_state_dict(clean, strict=False)
