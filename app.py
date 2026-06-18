@@ -1148,7 +1148,7 @@ if page == "🩺 Diagnostic Lab":
                 transcription   = text_to_analyze
 
             try:
-                predictions = predict_topk(text_to_analyze)
+                predictions = predict_topk(text_to_analyze, k=5)
             except Exception as e:
                 st.error(f"Model prediction failed: {e}")
                 st.stop()
@@ -1750,3 +1750,6 @@ elif page == "👤 Patient Search":
                             )
                     else:
                         st.caption("No imaging records.")
+                        
+                        
+                   
