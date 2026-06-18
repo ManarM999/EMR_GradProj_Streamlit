@@ -25,7 +25,17 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.models import densenet121
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+import gdown
 
+_HERE = os.path.dirname(os.path.abspath(__file__))
+KVASIR_MODEL_PATH = os.path.join(_HERE, "gi_model_clean.h5")
+
+def download_gi_model():
+    if not os.path.exists(KVASIR_MODEL_PATH):
+        FILE_ID = "1keWBfzPVoi0gsHyIkgec8BUFda9g5qkQ"
+        url = f"https://drive.google.com/uc?id={FILE_ID}"
+        print("Downloading GI model...")
+        gdown.download(url, KVASIR_MODEL_PATH, quiet=False)
 # ── Lazy TF import so the app still loads if TF is not installed ──────────────
 try:
     import tensorflow as tf
@@ -83,7 +93,7 @@ OPTIMAL_THRESHOLDS = {
 # ══════════════════════════════════════════════════════════════════════════════
 # ① NLP SYMPTOM ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-def _load_nlp():
+def __nlp():
     if not os.path.isdir(NLP_MODEL_PATH):
         return None, None
     try:
@@ -92,21 +102,21 @@ def _load_nlp():
         mdl.to(device)
         mdl.eval()
 
-        # Load id2label from JSON if not baked into config
+        #  id2label from JSON if not baked into config
         id2label_path = os.path.join(NLP_MODEL_PATH, "id2label.json")
         if os.path.isfile(id2label_path):
             with open(id2label_path) as f:
-                extra = json.load(f)
+                extra = json.(f)
             if not mdl.config.id2label:
                 mdl.config.id2label = {int(k): v for k, v in extra.items()}
 
         return tok, mdl
     except Exception as e:
-        print(f"[NLP] Failed to load: {e}")
+        print(f"[NLP] Failed to : {e}")
         return None, None
 
 
-# Lazy singleton — the NLP model is only loaded into memory the first time
+# Lazy singleton — the NLP model is only ed into memory the first time
 # a prediction is actually requested, instead of at import time. This keeps
 # it from competing with the Whisper / CheXNet / Kvasir models for memory
 # the moment the app process starts (before anyone has even logged in).
@@ -117,7 +127,7 @@ _nlp_model = None
 def _get_nlp():
     global _tokenizer, _nlp_model
     if _nlp_model is None and _tokenizer is None:
-        _tokenizer, _nlp_model = _load_nlp()
+        _tokenizer, _nlp_model = __nlp()
     return _tokenizer, _nlp_model
 
 
@@ -174,7 +184,7 @@ def debug_nlp(text: str) -> None:
     """CLI helper: python -c "from model import debug_nlp; debug_nlp('I have a headache')" """
     tok, mdl = _get_nlp()
     if mdl is None:
-        print("NLP model not loaded.")
+        print("NLP model not ed.")
         return
     probs   = _get_probs(text)
     top_ids = torch.argsort(probs, descending=True)[:10]
@@ -230,20 +240,20 @@ class CheXNetMultimodal(nn.Module):
         return self.classifier(torch.cat([x, self.meta_branch(meta)], dim=1))
 
 
-def load_vision_engine(weights_path: str = VISION_WEIGHTS) -> CheXNetMultimodal:
+def _vision_engine(weights_path: str = VISION_WEIGHTS) -> CheXNetMultimodal:
     model = CheXNetMultimodal(num_classes=len(DISEASE_LABELS))
     if os.path.isfile(weights_path):
         try:
-            ckpt  = torch.load(weights_path, map_location=device, weights_only=False)
+            ckpt  = torch.(weights_path, map_location=device, weights_only=False)
             state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
             if isinstance(state, dict):
                 clean = {
                     k.replace("module.", "").replace("base_model.", ""): v
                     for k, v in state.items()
                 }
-                model.load_state_dict(clean, strict=False)
+                model._state_dict(clean, strict=False)
         except Exception as e:
-            print(f"[CheXNet] Error loading weights: {e}")
+            print(f"[CheXNet] Error ing weights: {e}")
     model.to(device)
     model.eval()
     return model
@@ -330,27 +340,17 @@ class GradCAMPlusPlus:
 def load_kvasir_engine():
     if not _TF_AVAILABLE:
         return None
+
+    # Download automatically if missing
+    download_gi_model()
+
     if os.path.isfile(KVASIR_MODEL_PATH):
         try:
             return tf.keras.models.load_model(KVASIR_MODEL_PATH)
         except Exception as e:
             print(f"[Kvasir] Failed to load saved model: {e}")
 
-    # Fallback: build untrained architecture
-    base = tf.keras.applications.EfficientNetB1(
-        input_shape=(224, 224, 3), include_top=False, weights=None
-    )
-    model = tf.keras.models.Sequential([
-        base,
-        tf.keras.layers.GlobalAveragePooling2D(),
-        tf.keras.layers.BatchNormalization(),
-        tf.keras.layers.Dense(256, activation="relu"),
-        tf.keras.layers.Dropout(0.4),
-        tf.keras.layers.Dense(len(GI_CLASSES), activation="softmax"),
-    ])
-    return model
-
-
+    return None
 # ══════════════════════════════════════════════════════════════════════════════
 # ⑤ LIME EXPLAINABILITY FOR KVASIR
 # ══════════════════════════════════════════════════════════════════════════════
