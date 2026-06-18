@@ -8,12 +8,10 @@ Unified inference engine:
   ⑤ LIME explainability for Kvasir
 
 Weight files (model_only/, best_chexnet_multimodal.pth, gi_model_clean.h5)
-are used from a local copy next to this script if present (e.g. local dev).
-Otherwise:
-  - the NLP folder and the CheXNet .pth are downloaded from Hugging Face Hub
-  - the Kvasir .h5 is downloaded from Google Drive (via gdown)
-on first use. Update HF_WEIGHTS_REPO / HF_NLP_REPO / GDRIVE_KVASIR_FILE_ID
-below to match your own hosting.
+are used from a local copy next to this script if present (e.g. local dev),
+otherwise they're downloaded automatically from the Hugging Face Hub the
+first time each model is actually needed. Set HF_WEIGHTS_REPO / HF_NLP_REPO
+below to your own repo IDs after uploading the files there.
 """
 
 import os
@@ -29,7 +27,6 @@ from PIL import Image
 from torchvision.models import densenet121
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 from huggingface_hub import hf_hub_download
-import gdown
 
 # ── Lazy TF import so the app still loads if TF is not installed ──────────────
 try:
@@ -56,11 +53,9 @@ VISION_WEIGHTS    = os.path.join(_HERE, "best_chexnet_multimodal.pth")
 KVASIR_MODEL_PATH = os.path.join(_HERE, "gi_model_clean.h5")
 
 # Weight files are too large to live in the git repo, so they're fetched on
-# first use instead. NLP + CheXNet come from Hugging Face Hub; the Kvasir
-# model comes from Google Drive via gdown (update these to your own IDs/repos).
-HF_WEIGHTS_REPO      = "your-hf-username/sehatrack-weights"   # holds the .pth
-HF_NLP_REPO          = "your-hf-username/sehatrack-nlp"       # holds the model_only/ contents
-GDRIVE_KVASIR_FILE_ID = "1keWBfzPVoi0gsHyIkgec8BUFda9g5qkQ"
+# first use instead, all from the Hugging Face Hub repos below.
+HF_WEIGHTS_REPO = "your-hf-username/sehatrack-weights"   # holds the .pth and .h5
+HF_NLP_REPO     = "your-hf-username/sehatrack-nlp"        # holds the model_only/ contents
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = device
@@ -359,28 +354,28 @@ class GradCAMPlusPlus:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ④ KVASIR GI ENDOSCOPY ENGINE — fetched from Google Drive via gdown
+# ④ KVASIR GI ENDOSCOPY ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-def download_gi_model() -> None:
-    """Downloads the Kvasir .h5 from Google Drive if it isn't already on disk."""
-    if not os.path.exists(KVASIR_MODEL_PATH):
-        url = f"https://drive.google.com/uc?id={GDRIVE_KVASIR_FILE_ID}"
-        print("Downloading GI model...")
-        gdown.download(url, KVASIR_MODEL_PATH, quiet=False)
+def _resolve_kvasir_weights() -> Optional[str]:
+    """Use the local file if present; otherwise download it from the
+    Hugging Face Hub repo on first use (it isn't checked into git)."""
+    if os.path.isfile(KVASIR_MODEL_PATH):
+        return KVASIR_MODEL_PATH
+    try:
+        return hf_hub_download(repo_id=HF_WEIGHTS_REPO, filename="gi_model_clean.h5")
+    except Exception as e:
+        print(f"[Kvasir] Could not fetch weights from Hugging Face Hub: {e}")
+        return None
 
 
 def load_kvasir_engine():
     if not _TF_AVAILABLE:
         return None
 
-    try:
-        download_gi_model()
-    except Exception as e:
-        print(f"[Kvasir] Could not fetch weights from Google Drive: {e}")
-
-    if os.path.isfile(KVASIR_MODEL_PATH):
+    weights_path = _resolve_kvasir_weights()
+    if weights_path:
         try:
-            return tf.keras.models.load_model(KVASIR_MODEL_PATH)
+            return tf.keras.models.load_model(weights_path)
         except Exception as e:
             print(f"[Kvasir] Failed to load saved model: {e}")
 
