@@ -14,3 +14,4 @@ transformers==5.12.1
 lime==0.2.0.1
 scikit-image==0.26.0
 h5py==3.14.0
+gdown
