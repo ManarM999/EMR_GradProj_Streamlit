@@ -7,10 +7,13 @@ Unified inference engine:
   ④ Grad-CAM++ explainability for CheXNet
   ⑤ LIME explainability for Kvasir
 
-All paths are relative — place your weight files next to this script:
-    model_only/           ← HuggingFace NLP model directory
-    best_chexnet_multimodal.pth
-    gi_model_clean.h5
+Weight files (model_only/, best_chexnet_multimodal.pth, gi_model_clean.h5)
+are used from a local copy next to this script if present (e.g. local dev).
+Otherwise:
+  - the NLP folder and the CheXNet .pth are downloaded from Hugging Face Hub
+  - the Kvasir .h5 is downloaded from Google Drive (via gdown)
+on first use. Update HF_WEIGHTS_REPO / HF_NLP_REPO / GDRIVE_KVASIR_FILE_ID
+below to match your own hosting.
 """
 
 import os
@@ -25,17 +28,9 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision.models import densenet121
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from huggingface_hub import hf_hub_download
 import gdown
 
-_HERE = os.path.dirname(os.path.abspath(__file__))
-KVASIR_MODEL_PATH = os.path.join(_HERE, "gi_model_clean.h5")
-
-def download_gi_model():
-    if not os.path.exists(KVASIR_MODEL_PATH):
-        FILE_ID = "1keWBfzPVoi0gsHyIkgec8BUFda9g5qkQ"
-        url = f"https://drive.google.com/uc?id={FILE_ID}"
-        print("Downloading GI model...")
-        gdown.download(url, KVASIR_MODEL_PATH, quiet=False)
 # ── Lazy TF import so the app still loads if TF is not installed ──────────────
 try:
     import tensorflow as tf
@@ -56,9 +51,16 @@ except ImportError:
 # ══════════════════════════════════════════════════════════════════════════════
 _HERE = os.path.dirname(os.path.abspath(__file__))
 
-NLP_MODEL_PATH   = os.path.join(_HERE, "model_only")
-VISION_WEIGHTS   = os.path.join(_HERE, "best_chexnet_multimodal.pth")
+NLP_MODEL_PATH    = os.path.join(_HERE, "model_only")
+VISION_WEIGHTS    = os.path.join(_HERE, "best_chexnet_multimodal.pth")
 KVASIR_MODEL_PATH = os.path.join(_HERE, "gi_model_clean.h5")
+
+# Weight files are too large to live in the git repo, so they're fetched on
+# first use instead. NLP + CheXNet come from Hugging Face Hub; the Kvasir
+# model comes from Google Drive via gdown (update these to your own IDs/repos).
+HF_WEIGHTS_REPO      = "your-hf-username/sehatrack-weights"   # holds the .pth
+HF_NLP_REPO          = "your-hf-username/sehatrack-nlp"       # holds the model_only/ contents
+GDRIVE_KVASIR_FILE_ID = "1keWBfzPVoi0gsHyIkgec8BUFda9g5qkQ"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = device
@@ -93,30 +95,39 @@ OPTIMAL_THRESHOLDS = {
 # ══════════════════════════════════════════════════════════════════════════════
 # ① NLP SYMPTOM ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
-def __nlp():
-    if not os.path.isdir(NLP_MODEL_PATH):
-        return None, None
+def _load_nlp():
+    # Prefer local files (e.g. local dev where you still have model_only/ on
+    # disk); fall back to the Hugging Face Hub repo when it's missing, which
+    # is what happens on Railway since the weights were never pushed to git.
+    source = NLP_MODEL_PATH if os.path.isdir(NLP_MODEL_PATH) else HF_NLP_REPO
     try:
-        tok = AutoTokenizer.from_pretrained(NLP_MODEL_PATH)
-        mdl = AutoModelForSequenceClassification.from_pretrained(NLP_MODEL_PATH)
+        tok = AutoTokenizer.from_pretrained(source)
+        mdl = AutoModelForSequenceClassification.from_pretrained(source)
         mdl.to(device)
         mdl.eval()
 
-        #  id2label from JSON if not baked into config
-        id2label_path = os.path.join(NLP_MODEL_PATH, "id2label.json")
-        if os.path.isfile(id2label_path):
+        # Load id2label from JSON if not baked into config
+        if os.path.isdir(NLP_MODEL_PATH):
+            id2label_path = os.path.join(NLP_MODEL_PATH, "id2label.json")
+        else:
+            try:
+                id2label_path = hf_hub_download(repo_id=HF_NLP_REPO, filename="id2label.json")
+            except Exception:
+                id2label_path = None
+
+        if id2label_path and os.path.isfile(id2label_path):
             with open(id2label_path) as f:
-                extra = json.(f)
+                extra = json.load(f)
             if not mdl.config.id2label:
                 mdl.config.id2label = {int(k): v for k, v in extra.items()}
 
         return tok, mdl
     except Exception as e:
-        print(f"[NLP] Failed to : {e}")
+        print(f"[NLP] Failed to load: {e}")
         return None, None
 
 
-# Lazy singleton — the NLP model is only ed into memory the first time
+# Lazy singleton — the NLP model is only loaded into memory the first time
 # a prediction is actually requested, instead of at import time. This keeps
 # it from competing with the Whisper / CheXNet / Kvasir models for memory
 # the moment the app process starts (before anyone has even logged in).
@@ -127,7 +138,7 @@ _nlp_model = None
 def _get_nlp():
     global _tokenizer, _nlp_model
     if _nlp_model is None and _tokenizer is None:
-        _tokenizer, _nlp_model = __nlp()
+        _tokenizer, _nlp_model = _load_nlp()
     return _tokenizer, _nlp_model
 
 
@@ -184,7 +195,7 @@ def debug_nlp(text: str) -> None:
     """CLI helper: python -c "from model import debug_nlp; debug_nlp('I have a headache')" """
     tok, mdl = _get_nlp()
     if mdl is None:
-        print("NLP model not ed.")
+        print("NLP model not loaded.")
         return
     probs   = _get_probs(text)
     top_ids = torch.argsort(probs, descending=True)[:10]
@@ -240,20 +251,33 @@ class CheXNetMultimodal(nn.Module):
         return self.classifier(torch.cat([x, self.meta_branch(meta)], dim=1))
 
 
-def _vision_engine(weights_path: str = VISION_WEIGHTS) -> CheXNetMultimodal:
+def _resolve_vision_weights() -> Optional[str]:
+    """Use the local file if present; otherwise download it from the
+    Hugging Face Hub repo on first use (it isn't checked into git)."""
+    if os.path.isfile(VISION_WEIGHTS):
+        return VISION_WEIGHTS
+    try:
+        return hf_hub_download(repo_id=HF_WEIGHTS_REPO, filename="best_chexnet_multimodal.pth")
+    except Exception as e:
+        print(f"[CheXNet] Could not fetch weights from Hugging Face Hub: {e}")
+        return None
+
+
+def load_vision_engine() -> CheXNetMultimodal:
     model = CheXNetMultimodal(num_classes=len(DISEASE_LABELS))
-    if os.path.isfile(weights_path):
+    weights_path = _resolve_vision_weights()
+    if weights_path:
         try:
-            ckpt  = torch.(weights_path, map_location=device, weights_only=False)
+            ckpt  = torch.load(weights_path, map_location=device, weights_only=False)
             state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
             if isinstance(state, dict):
                 clean = {
                     k.replace("module.", "").replace("base_model.", ""): v
                     for k, v in state.items()
                 }
-                model._state_dict(clean, strict=False)
+                model.load_state_dict(clean, strict=False)
         except Exception as e:
-            print(f"[CheXNet] Error ing weights: {e}")
+            print(f"[CheXNet] Error loading weights: {e}")
     model.to(device)
     model.eval()
     return model
@@ -335,14 +359,24 @@ class GradCAMPlusPlus:
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ④ KVASIR GI ENDOSCOPY ENGINE
+# ④ KVASIR GI ENDOSCOPY ENGINE — fetched from Google Drive via gdown
 # ══════════════════════════════════════════════════════════════════════════════
+def download_gi_model() -> None:
+    """Downloads the Kvasir .h5 from Google Drive if it isn't already on disk."""
+    if not os.path.exists(KVASIR_MODEL_PATH):
+        url = f"https://drive.google.com/uc?id={GDRIVE_KVASIR_FILE_ID}"
+        print("Downloading GI model...")
+        gdown.download(url, KVASIR_MODEL_PATH, quiet=False)
+
+
 def load_kvasir_engine():
     if not _TF_AVAILABLE:
         return None
 
-    # Download automatically if missing
-    download_gi_model()
+    try:
+        download_gi_model()
+    except Exception as e:
+        print(f"[Kvasir] Could not fetch weights from Google Drive: {e}")
 
     if os.path.isfile(KVASIR_MODEL_PATH):
         try:
@@ -351,6 +385,8 @@ def load_kvasir_engine():
             print(f"[Kvasir] Failed to load saved model: {e}")
 
     return None
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ⑤ LIME EXPLAINABILITY FOR KVASIR
 # ══════════════════════════════════════════════════════════════════════════════
