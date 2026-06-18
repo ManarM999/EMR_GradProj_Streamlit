@@ -257,16 +257,23 @@ def _resolve_vision_weights() -> Optional[str]:
 def load_vision_engine() -> CheXNetMultimodal:
     model = CheXNetMultimodal(num_classes=len(DISEASE_LABELS))
     weights_path = _resolve_vision_weights()
+    print(f"[CheXNet] Resolved weights path: {weights_path}")
     if weights_path:
         try:
             ckpt  = torch.load(weights_path, map_location=device, weights_only=False)
+            print(f"[CheXNet] Checkpoint type: {type(ckpt)}, top-level keys: "
+                  f"{list(ckpt.keys()) if isinstance(ckpt, dict) else 'n/a'}")
             state = ckpt.get("model_state_dict") or ckpt.get("state_dict") or ckpt
             if isinstance(state, dict):
                 clean = {
                     k.replace("module.", "").replace("base_model.", ""): v
                     for k, v in state.items()
                 }
-                model.load_state_dict(clean, strict=False)
+                result = model.load_state_dict(clean, strict=False)
+                total = len(model.state_dict())
+                print(f"[CheXNet] Matched {total - len(result.missing_keys)}/{total} parameter tensors")
+                print(f"[CheXNet] Missing (sample): {result.missing_keys[:8]}")
+                print(f"[CheXNet] Unexpected (sample): {result.unexpected_keys[:8]}")
         except Exception as e:
             print(f"[CheXNet] Error loading weights: {e}")
     model.to(device)
