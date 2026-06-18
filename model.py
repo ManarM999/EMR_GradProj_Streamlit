@@ -202,6 +202,15 @@ def debug_nlp(text: str) -> None:
 # ══════════════════════════════════════════════════════════════════════════════
 # ② CHEXNET MULTIMODAL X-RAY ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
+def encode_meta(age: Any, gender: Any, view_pos: Any) -> torch.Tensor:
+    """Encode patient metadata into a 3-value tensor for the CheXNet meta branch."""
+    try:
+        a = max(0.0, min(float(age), 120.0)) / 120.0
+    except Exception:
+        a = 0.0
+    g = 1.0 if str(gender).lower().strip() == "female" else 0.0
+    v = 1.0 if "ap" in str(view_pos).lower() else 0.0
+    return torch.tensor([[a, g, v]], dtype=torch.float32)
 class CheXNetMultimodal(nn.Module):
     def __init__(self, num_classes: int = 14, meta_dim: int = 3, dropout_rate: float = 0.4):
         super().__init__()
