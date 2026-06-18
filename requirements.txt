@@ -1,12 +1,12 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
 streamlit==1.58.0
 opencv-python-headless==4.13.0.92
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.12.0+cpu
-torchvision==0.27.0+cpu
-numpy>=1.26,<2.1
-pandas==2.2.3
+numpy==2.0.2
+pandas==3.0.3
 plotly==6.8.0
 soundfile==0.14.0
+torch==2.12.0
+torchvision==0.27.0
 openai-whisper==20250625
 pillow==12.2.0
 tensorflow==2.18.0
@@ -14,4 +14,4 @@ transformers==5.12.1
 lime==0.2.0.1
 scikit-image==0.26.0
 h5py==3.14.0
-gdown
+huggingface_hub==0.34.0
