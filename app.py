@@ -1539,7 +1539,10 @@ elif page == "📊 Insights Hub":
         st.warning("No visit data yet. Run some diagnoses first.")
         st.stop()
 
-    df["visit_datetime"] = pd.to_datetime(df["visit_datetime"])
+    df["visit_datetime"] = pd.to_datetime(
+    df["visit_datetime"],
+    errors="coerce"
+)
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Patients",    df["patient_id"].nunique())
