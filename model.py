@@ -87,30 +87,41 @@ OPTIMAL_THRESHOLDS = {
 # ① NLP SYMPTOM ENGINE
 # ══════════════════════════════════════════════════════════════════════════════
 def _load_nlp():
-    # Prefer local files (e.g. local dev where you still have model_only/ on
-    # disk); fall back to the Hugging Face Hub repo when it's missing, which
-    # is what happens on Railway since the weights were never pushed to git.
-    source = NLP_MODEL_PATH if os.path.isdir(NLP_MODEL_PATH) else HF_NLP_REPO
+    use_local = os.path.isdir(NLP_MODEL_PATH)
+    source    = NLP_MODEL_PATH if use_local else HF_NLP_REPO
+    # On the Hub, all the NLP files live inside a "model_only" subfolder of
+    # the repo rather than at the repo root, so from_pretrained needs to be
+    # told that explicitly. A local checkout already points straight at the
+    # right folder, so no subfolder is needed in that case.
+    subfolder = None if use_local else "model_only"
+
     try:
-        tok = AutoTokenizer.from_pretrained(source)
-        mdl = AutoModelForSequenceClassification.from_pretrained(source)
+        kwargs = {"subfolder": subfolder} if subfolder else {}
+
+        tok = AutoTokenizer.from_pretrained(source, **kwargs)
+        mdl = AutoModelForSequenceClassification.from_pretrained(source, **kwargs)
         mdl.to(device)
         mdl.eval()
 
         # Load id2label from JSON if not baked into config
-        if os.path.isdir(NLP_MODEL_PATH):
+        if use_local:
             id2label_path = os.path.join(NLP_MODEL_PATH, "id2label.json")
         else:
             try:
-                id2label_path = hf_hub_download(repo_id=HF_NLP_REPO, filename="id2label.json")
-            except Exception:
+                id2label_path = hf_hub_download(
+                    repo_id=HF_NLP_REPO,
+                    filename="id2label.json",
+                    subfolder="model_only",
+                )
+            except Exception as e:
+                print(f"[NLP] Could not fetch id2label.json: {e}")
                 id2label_path = None
 
         if id2label_path and os.path.isfile(id2label_path):
             with open(id2label_path) as f:
                 extra = json.load(f)
-            if not mdl.config.id2label:
-                mdl.config.id2label = {int(k): v for k, v in extra.items()}
+            mdl.config.id2label = {int(k): v for k, v in extra.items()}
+            mdl.config.label2id  = {v: int(k) for k, v in extra.items()}
 
         return tok, mdl
     except Exception as e:
@@ -437,3 +448,5 @@ def run_kvasir_lime_explanation(
     ]
 
     return class_name, confidence, chart_data, boundary_img
+
+
