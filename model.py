@@ -7,11 +7,7 @@ Unified inference engine:
   ④ Grad-CAM++ explainability for CheXNet
   ⑤ LIME explainability for Kvasir
 
-Weight files (model_only/, best_chexnet_multimodal.pth, gi_model_clean.h5)
-are used from a local copy next to this script if present (e.g. local dev),
-otherwise they're downloaded automatically from the Hugging Face Hub the
-first time each model is actually needed. Set HF_WEIGHTS_REPO / HF_NLP_REPO
-below to your own repo IDs after uploading the files there.
+
 """
 
 import os
@@ -54,8 +50,8 @@ KVASIR_MODEL_PATH = os.path.join(_HERE, "gi_model_clean.h5")
 
 # Weight files are too large to live in the git repo, so they're fetched on
 # first use instead, all from the Hugging Face Hub repos below.
-HF_WEIGHTS_REPO = "your-hf-username/sehatrack-weights"   # holds the .pth and .h5
-HF_NLP_REPO     = "your-hf-username/sehatrack-nlp"        # holds the model_only/ contents
+HF_WEIGHTS_REPO = "m1881/sehatrack-weights"   # holds the .pth and .h5
+HF_NLP_REPO     = "m1881/sehatrack-nlp"        # holds the model_only/ contents
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 DEVICE = device
