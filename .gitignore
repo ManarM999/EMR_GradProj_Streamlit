@@ -1,7 +1,9 @@
-.venv/
-venv/
+*.pth
+*.pth.zip
+*.h5
+model_only/
+sehatrack.db
+saved/
 __pycache__/
 *.pyc
-*.pyd
-*.db
-saved/
+.env
