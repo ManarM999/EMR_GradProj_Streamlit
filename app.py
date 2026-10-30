@@ -13,14 +13,29 @@ Unified Streamlit application combining:
   • Clinical insights dashboard
   • Clinical logs with CSV export
   • Patient search
+
+FIXES IN THIS VERSION
+  1. Images are rendered with show_image() (base64, embedded in the page)
+     instead of st.image(), so they no longer depend on Streamlit's /media
+     route, which was failing with the ASGI "http.response.start" error.
+  2. Diagnostic Lab results and the prescription form now live outside the
+     "Analyze" button block (via st.session_state), so "Save Prescriptions"
+     actually saves.
+  3. Whisper audio is converted to mono 16 kHz before transcription.
+  4. Model-loading errors are no longer cached as None; the real error is
+     shown on the page instead of a generic message.
+  5. Removed deprecated use_container_width arguments (version-proof).
+  6. Cleaned the patient "already has an account" check.
 """
 
+import base64
 import hashlib
 import io
 import json
 import os
 import sqlite3
 import tempfile
+import traceback
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -110,6 +125,55 @@ div.stButton > button:hover { background: #1d4ed8; }
 .appt-rejected { background: #fef2f2; border-left: 4px solid #ef4444; padding: 10px 16px; border-radius: 8px; margin-bottom: 6px; }
 </style>
 """, unsafe_allow_html=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DISPLAY HELPERS (version-proof; no use of Streamlit's /media route for images)
+# ══════════════════════════════════════════════════════════════════════════════
+def show_image(img: Any, caption: str = "", max_side: int = 768) -> None:
+    """
+    Render an image embedded directly in the page as base64.
+    Accepts a PIL image, a numpy array (uint8 or float 0-1), or a file path.
+    This avoids Streamlit's /media file route entirely.
+    """
+    try:
+        if isinstance(img, (str, os.PathLike)):
+            img = Image.open(img)
+        if isinstance(img, np.ndarray):
+            arr = np.squeeze(img)
+            if arr.ndim == 3 and arr.shape[0] in (1, 3) and arr.shape[-1] not in (1, 3):
+                arr = np.transpose(arr, (1, 2, 0))
+            if arr.dtype != np.uint8:
+                if arr.max() <= 1.0:
+                    arr = np.clip(arr, 0, 1) * 255
+                arr = np.clip(arr, 0, 255).astype(np.uint8)
+            if arr.ndim == 3 and arr.shape[-1] == 1:
+                arr = arr[:, :, 0]
+            img = Image.fromarray(arr)
+        img = img.convert("RGB")
+        img.thumbnail((max_side, max_side))
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        st.markdown(
+            "<figure style='margin:0;text-align:center'>"
+            f"<img src='data:image/png;base64,{b64}' "
+            "style='max-width:100%;height:auto;border-radius:8px'/>"
+            f"<figcaption style='color:#64748b;font-size:14px;margin-top:4px'>{caption}</figcaption>"
+            "</figure>",
+            unsafe_allow_html=True,
+        )
+    except Exception as e:
+        st.warning(f"Could not display image ({caption}): {e}")
+
+
+def show_df(df: pd.DataFrame) -> None:
+    st.dataframe(df)
+
+
+def show_plot(fig: go.Figure) -> None:
+    st.plotly_chart(fig)
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # DATABASE
@@ -533,57 +597,90 @@ def get_patient_followups(patient_id: str) -> pd.DataFrame:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MODEL LOADING — cached + LAZY.
-# Each model is only loaded into memory the first time the feature that needs
-# it is actually used (not at startup), so a fresh container never has to hold
-# Whisper + the vision model + the Kvasir model in RAM all at once just to
-# render the login screen. st.cache_resource still ensures each one is only
-# ever loaded once per process and reused after that.
+# Each model is only loaded the first time the feature that needs it is used.
+# The cached loaders do NOT swallow exceptions: if a load fails, the exception
+# propagates (so Streamlit does not cache a failure) and the getter below
+# records the real error message so it can be shown on the page.
 # ══════════════════════════════════════════════════════════════════════════════
+@st.cache_resource(show_spinner="Loading Whisper model…")
+def _load_whisper():
+    return whisper.load_model("small")
+
+
+@st.cache_resource(show_spinner="Loading chest X-ray model…")
+def _load_vision():
+    return load_vision_engine()
+
+
+@st.cache_resource(show_spinner="Loading GI endoscopy model…")
+def _load_kvasir():
+    return load_kvasir_engine()
+
+
 @st.cache_resource(show_spinner=False)
+def _load_gradcam():
+    return GradCAMPlusPlus(_load_vision())
+
+
+def _safe_get(loader, name: str):
+    try:
+        return loader()
+    except Exception as e:  # noqa: BLE001
+        st.session_state.setdefault("model_errors", {})[name] = (
+            f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
+        )
+        return None
+
+
 def get_whisper():
-    try:
-        return whisper.load_model("small")
-    except Exception:
-        return None
+    return _safe_get(_load_whisper, "whisper")
 
 
-@st.cache_resource(show_spinner=False)
 def get_vision():
-    try:
-        return load_vision_engine()
-    except Exception:
-        return None
+    return _safe_get(_load_vision, "vision")
 
 
-@st.cache_resource(show_spinner=False)
 def get_kvasir():
-    try:
-        return load_kvasir_engine()
-    except Exception:
-        return None
-
-
-_gradcam_engine = None
+    return _safe_get(_load_kvasir, "kvasir")
 
 
 def get_gradcam():
-    """Lazily builds the Grad-CAM++ wrapper around the (lazily loaded) vision model."""
-    global _gradcam_engine
-    if _gradcam_engine is None:
-        vmodel = get_vision()
-        _gradcam_engine = GradCAMPlusPlus(vmodel) if vmodel is not None else None
-    return _gradcam_engine
+    return _safe_get(_load_gradcam, "gradcam")
+
+
+def show_model_error(name: str) -> None:
+    err = st.session_state.get("model_errors", {}).get(name)
+    if err:
+        with st.expander("Show technical error details"):
+            st.code(err)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 # UTILITY FUNCTIONS
 # ══════════════════════════════════════════════════════════════════════════════
 def audio_to_text(audio_file) -> Tuple[str, float]:
+    wmodel = get_whisper()
+    if wmodel is None:
+        raise RuntimeError("Whisper model could not be loaded.")
+
     audio_bytes = audio_file.read()
     data, sr    = sf.read(io.BytesIO(audio_bytes))
     data        = np.asarray(data, dtype=np.float32)
-    result      = get_whisper().transcribe(data, fp16=False)
-    return result["text"], len(data) / sr
+    duration    = len(data) / sr
+
+    # Whisper expects mono audio at 16 kHz
+    if data.ndim > 1:
+        data = data.mean(axis=1)
+    if sr != 16000:
+        n_target = int(len(data) * 16000 / sr)
+        data = np.interp(
+            np.linspace(0, len(data) - 1, n_target),
+            np.arange(len(data)),
+            data,
+        ).astype(np.float32)
+
+    result = wmodel.transcribe(data, fp16=False)
+    return result["text"].strip(), duration
 
 
 def transcribe_file_whisper(audio_file) -> Optional[str]:
@@ -689,7 +786,7 @@ def render_longitudinal_chart(patient_id: str) -> None:
 
     if not points:
         return
-    df   = pd.DataFrame(points)
+    df    = pd.DataFrame(points)
     paths = [c for c in df.columns if c not in ("Timestamp", "Modality")]
     if not paths:
         return
@@ -700,7 +797,7 @@ def render_longitudinal_chart(patient_id: str) -> None:
         fig  = px.line(melt, x="Timestamp", y="Probability",
                        color="Condition", markers=True, template="plotly_white")
         fig.update_layout(yaxis_title="AI Confidence")
-        st.plotly_chart(fig, use_container_width=True)
+        show_plot(fig)
 
 
 def render_chat(sender_id: int, receiver_id: int, partner_name: str) -> None:
@@ -729,6 +826,133 @@ def render_chat(sender_id: int, receiver_id: int, partner_name: str) -> None:
             (sender_id, receiver_id, prompt.strip()),
         )
         st.rerun()
+
+
+URGENCY_ICON = {"routine": "🟢", "soon": "🟡", "urgent": "🟠", "emergency": "🔴"}
+
+
+def render_diagnostic_result(res: Dict[str, Any]) -> None:
+    """
+    Renders the Diagnostic Lab results + prescription form for the last saved
+    visit. Lives OUTSIDE the 'Analyze' button block so that widgets inside it
+    (like 'Save Prescriptions') keep working after a rerun.
+    """
+    visit_id    = res["visit_id"]
+    patient_id  = res["patient_id"]
+    predictions = res["predictions"]
+    top1        = res["top1"]
+    severity    = res["severity"]
+    urgency     = res["urgency"]
+
+    if res["is_returning"]:
+        st.info(
+            f"🔁 Returning patient — {len(get_patient_history(patient_id))} "
+            f"visit(s) on record. New visit added."
+        )
+    else:
+        st.success("✅ New patient registered and visit saved.")
+    st.caption(f"Patient ID: `{patient_id}` · Visit ID: `{visit_id}`")
+
+    if res.get("transcription"):
+        st.markdown("#### 🎙️ Transcription")
+        st.info(f'"{res["transcription"]}"')
+        if res.get("audio_duration"):
+            st.caption(f"Audio duration: {res['audio_duration']:.1f}s")
+
+    r1, r2, r3, r4 = st.columns(4)
+    r1.metric("Top Symptom", top1["label"])
+    r2.metric("Confidence",  f"{top1['score']:.1%}")
+    r3.metric("Severity",    f"{severity}/10")
+    r4.metric("Urgency",     f"{URGENCY_ICON.get(urgency, '')} {urgency.capitalize()}")
+
+    st.markdown("#### 🩺 All Predicted Symptoms")
+    pred_df        = pd.DataFrame(predictions)
+    pred_df["pct"] = (pred_df["score"] * 100).round(2)
+    colors         = ["#2563eb" if i == 0 else "#93c5fd" for i in range(len(pred_df))]
+    fig_preds = go.Figure(go.Bar(
+        x=pred_df["pct"], y=pred_df["label"], orientation="h",
+        marker_color=colors,
+        text=pred_df["pct"].apply(lambda v: f"{v:.1f}%"),
+        textposition="outside",
+    ))
+    fig_preds.update_layout(
+        xaxis=dict(title="Confidence (%)", range=[0, max(pred_df["pct"]) * 1.15]),
+        yaxis=dict(autorange="reversed"),
+        height=max(300, len(pred_df) * 32),
+        margin=dict(l=10, r=40, t=10, b=30),
+        plot_bgcolor="white",
+    )
+    show_plot(fig_preds)
+
+    fig_gauge = go.Figure(go.Indicator(
+        mode="gauge+number",
+        value=top1["score"] * 100,
+        title={"text": f"Confidence — {top1['label']}"},
+        gauge={
+            "axis": {"range": [0, 100]},
+            "bar": {"color": "#2563eb"},
+            "steps": [
+                {"range": [0, 50],   "color": "#fee2e2"},
+                {"range": [50, 75],  "color": "#fef9c3"},
+                {"range": [75, 100], "color": "#dcfce7"},
+            ],
+        },
+    ))
+    show_plot(fig_gauge)
+
+    # ── Prescriptions ─────────────────────────────────────────────────────────
+    st.markdown("### 4 — Prescriptions")
+    with st.expander("➕ Add medications to this visit", expanded=False):
+        num_meds = st.number_input("Number of medications", 1, 10, 1, key="num_meds")
+        meds_to_save = []
+        for i in range(int(num_meds)):
+            st.markdown(f"**Medication {i + 1}**")
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            with mc1:
+                mname = st.text_input("Name",      key=f"mname_{i}", placeholder="e.g. Amoxicillin")
+            with mc2:
+                mdose = st.text_input("Dosage",    key=f"mdose_{i}", placeholder="e.g. 500mg")
+            with mc3:
+                mfreq = st.text_input("Frequency", key=f"mfreq_{i}", placeholder="e.g. 3x daily")
+            with mc4:
+                mdur  = st.text_input("Duration",  key=f"mdur_{i}",  placeholder="e.g. 7 days")
+            mnotes = st.text_input("Notes", key=f"mnotes_{i}", placeholder="Take after meals")
+            if mname:
+                meds_to_save.append({
+                    "medication_name": mname, "dosage": mdose,
+                    "frequency": mfreq, "duration": mdur, "notes": mnotes,
+                })
+
+        if st.button("💊 Save Prescriptions", key="btn_rx"):
+            if meds_to_save:
+                add_prescription(visit_id, patient_id, res["doctor_id"], meds_to_save)
+                st.success(f"Saved {len(meds_to_save)} prescription(s).")
+            else:
+                st.warning("Enter at least one medication name.")
+
+    saved_rx = get_visit_prescriptions(visit_id)
+    if not saved_rx.empty:
+        st.markdown("**Prescriptions saved for this visit:**")
+        show_df(saved_rx[["medication_name", "dosage", "frequency", "duration", "notes"]])
+
+    st.markdown(f"#### 📋 Medical history — {res['p_name']}")
+    hist = get_patient_history(patient_id)
+    if not hist.empty:
+        disp = hist[[
+            "visit_datetime", "visit_type", "department", "chief_complaint",
+            "asr_transcription", "symptom_top1", "symptom_top1_score",
+            "symptom_top2", "symptom_top3", "urgency", "severity_score",
+            "follow_up_needed", "doctor_name", "doctor_notes",
+        ]].copy()
+        disp.columns = [
+            "Date", "Type", "Dept", "Chief Complaint", "Transcription",
+            "Symptom 1", "Confidence", "Symptom 2", "Symptom 3",
+            "Urgency", "Severity", "Follow-up", "Doctor", "Notes",
+        ]
+        disp["Confidence"] = disp["Confidence"].apply(
+            lambda v: f"{v:.1%}" if pd.notna(v) else ""
+        )
+        show_df(disp)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -824,7 +1048,6 @@ if st.session_state.doctor is None and st.session_state.patient is None:
                                    f"{existing.get('gender','—')}, age {existing.get('age','—')}")
                     else:
                         st.session_state["found_patient"] = None
-                        # Show all patients whose name loosely matches for debugging
                         close = _fetch_all(
                             "SELECT full_name, date_of_birth, patient_id FROM patients WHERE full_name LIKE ?",
                             (f"%{pr_name.strip().split()[0]}%",)
@@ -837,9 +1060,10 @@ if st.session_state.doctor is None and st.session_state.patient is None:
 
                 if st.session_state.get("found_patient"):
                     found = st.session_state["found_patient"]
-                    if found.get("password_hash") if "password_hash" in found else _fetch_one(
+                    acct  = _fetch_one(
                         "SELECT password_hash FROM patients WHERE patient_id=?", (found["patient_id"],)
-                    ).get("password_hash"):
+                    )
+                    if acct and acct.get("password_hash"):
                         st.warning("This patient already has a portal account. Please log in instead.")
                     else:
                         st.markdown("---")
@@ -860,7 +1084,6 @@ if st.session_state.doctor is None and st.session_state.patient is None:
                             else:
                                 st.error("Username already taken. Please choose another.")
 
-               
     st.stop()
 
 
@@ -928,7 +1151,7 @@ if st.session_state.patient is not None:
         if not linked_docs:
             st.info("No doctor linked to your account yet. You need at least one visit on record before booking.")
         else:
-            doc_opts = {f"{v['full_name']} — {v['specialty']}": v for v in linked_docs}
+            doc_opts    = {f"{v['full_name']} — {v['specialty']}": v for v in linked_docs}
             sel_doc_str = st.selectbox("Select doctor:", list(doc_opts.keys()))
             sel_doc     = doc_opts[sel_doc_str]
 
@@ -951,7 +1174,6 @@ if st.session_state.patient is not None:
                     st.success("✅ Request sent! Your doctor will confirm shortly.")
                     st.rerun()
 
-            # Show existing requests
             st.markdown("---")
             st.markdown("#### My Appointment Requests")
             appts = get_patient_appointments(pid)
@@ -1018,7 +1240,7 @@ if st.session_state.patient is not None:
                 "Primary Symptom", "Urgency", "Severity",
                 "Follow-up", "Doctor", "Doctor Notes",
             ]
-            st.dataframe(disp, use_container_width=True)
+            show_df(disp)
 
     # ── My Imaging ────────────────────────────────────────────────────────────
     elif pat_page == "🩻 My Imaging":
@@ -1032,7 +1254,7 @@ if st.session_state.patient is not None:
         for r in recs:
             with st.expander(f"📷 {r['timestamp']} — {r.get('view_position', '?')}"):
                 if r.get("image_path") and os.path.isfile(r["image_path"]):
-                    st.image(r["image_path"], width=300)
+                    show_image(r["image_path"], "", max_side=400)
                 render_imaging_findings(r.get("all_findings"))
 
     # ── Chat with Doctor ──────────────────────────────────────────────────────
@@ -1079,6 +1301,7 @@ with st.sidebar:
     st.markdown("---")
     if st.button("🚪 Log Out"):
         st.session_state.doctor = None
+        st.session_state.pop("dx_result", None)
         st.rerun()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1138,11 +1361,11 @@ if page == "🩺 Diagnostic Lab":
             if audio_input:
                 try:
                     transcription, audio_duration = audio_to_text(audio_input)
-                    st.info(f"🎙️ Transcribed: *{transcription}*")
-                    text_to_analyze = transcription
+                    text_to_analyze = transcription or user_text or "fever and cough"
                 except Exception as e:
                     st.warning(f"Audio transcription failed: {e}")
                     text_to_analyze = user_text or "fever and cough"
+                    transcription   = text_to_analyze
             else:
                 text_to_analyze = user_text or "fever and cough"
                 transcription   = text_to_analyze
@@ -1157,9 +1380,14 @@ if page == "🩺 Diagnostic Lab":
             top2 = predictions[1] if len(predictions) > 1 else {"label": None, "score": None}
             top3 = predictions[2] if len(predictions) > 2 else {"label": None, "score": None}
 
-            urgency_map = {range(1, 4): "routine", range(4, 6): "soon",
-                           range(6, 8): "urgent", range(8, 11): "emergency"}
-            urgency = next((v for k, v in urgency_map.items() if severity in k), "routine")
+            if severity <= 3:
+                urgency = "routine"
+            elif severity <= 5:
+                urgency = "soon"
+            elif severity <= 7:
+                urgency = "urgent"
+            else:
+                urgency = "emergency"
 
             patient_data = {
                 "full_name": p_name, "date_of_birth": str(p_dob), "age": age,
@@ -1181,111 +1409,23 @@ if page == "🩺 Diagnostic Lab":
             }
             visit_id = save_visit(patient_id, doc["id"], vd, [])
 
-        if is_returning:
-            st.info(
-                f"🔁 Returning patient — {len(get_patient_history(patient_id))} "
-                f"previous visit(s). New visit added."
-            )
-        else:
-            st.success("✅ New patient registered and visit saved.")
-        st.caption(f"Patient ID: `{patient_id}` · Visit ID: `{visit_id}`")
+        # Keep everything in session_state so the results and the prescription
+        # form survive reruns (e.g. when "Save Prescriptions" is clicked).
+        st.session_state["dx_result"] = {
+            "visit_id": visit_id, "patient_id": patient_id,
+            "doctor_id": doc["id"], "p_name": p_name,
+            "is_returning": is_returning, "predictions": predictions,
+            "top1": top1, "severity": severity, "urgency": urgency,
+            "transcription": transcription, "audio_duration": audio_duration,
+        }
+        # Clear any previous medication inputs
+        for k in [k for k in st.session_state.keys()
+                  if k.startswith(("mname_", "mdose_", "mfreq_", "mdur_", "mnotes_"))]:
+            del st.session_state[k]
 
-        if transcription:
-            st.markdown("#### 🎙️ Transcription")
-            st.info(f'"{transcription}"')
-            if audio_duration:
-                st.caption(f"Audio duration: {audio_duration:.1f}s")
-
-        URGENCY_ICON = {"routine": "🟢", "soon": "🟡", "urgent": "🟠", "emergency": "🔴"}
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Top Symptom",  top1["label"])
-        r2.metric("Confidence",   f"{top1['score']:.1%}")
-        r3.metric("Severity",     f"{severity}/10")
-        r4.metric("Urgency", f"{URGENCY_ICON.get(urgency, '')} {urgency.capitalize()}")
-
-        st.markdown("#### 🩺 All Predicted Symptoms")
-        pred_df        = pd.DataFrame(predictions)
-        pred_df["pct"] = (pred_df["score"] * 100).round(2)
-        colors         = ["#2563eb" if i == 0 else "#93c5fd" for i in range(len(pred_df))]
-        fig_preds = go.Figure(go.Bar(
-            x=pred_df["pct"], y=pred_df["label"], orientation="h",
-            marker_color=colors,
-            text=pred_df["pct"].apply(lambda v: f"{v:.1f}%"),
-            textposition="outside",
-        ))
-        fig_preds.update_layout(
-            xaxis=dict(title="Confidence (%)", range=[0, max(pred_df["pct"]) * 1.15]),
-            yaxis=dict(autorange="reversed"),
-            height=max(300, len(pred_df) * 32),
-            margin=dict(l=10, r=40, t=10, b=30),
-            plot_bgcolor="white",
-        )
-        st.plotly_chart(fig_preds, use_container_width=True)
-
-        fig_gauge = go.Figure(go.Indicator(
-            mode="gauge+number",
-            value=top1["score"] * 100,
-            title={"text": f"Confidence — {top1['label']}"},
-            gauge={
-                "axis": {"range": [0, 100]},
-                "bar": {"color": "#2563eb"},
-                "steps": [
-                    {"range": [0, 50],   "color": "#fee2e2"},
-                    {"range": [50, 75],  "color": "#fef9c3"},
-                    {"range": [75, 100], "color": "#dcfce7"},
-                ],
-            },
-        ))
-        st.plotly_chart(fig_gauge, use_container_width=True)
-
-        # ── Prescriptions section (shown after visit is saved) ────────────────
-        st.markdown("### 4 — Prescriptions")
-        with st.expander("➕ Add medications to this visit"):
-            num_meds = st.number_input("Number of medications", 1, 10, 1, key="num_meds")
-            meds_to_save = []
-            for i in range(int(num_meds)):
-                st.markdown(f"**Medication {i + 1}**")
-                mc1, mc2, mc3, mc4 = st.columns(4)
-                with mc1:
-                    mname = st.text_input("Name",      key=f"mname_{i}", placeholder="e.g. Amoxicillin")
-                with mc2:
-                    mdose = st.text_input("Dosage",    key=f"mdose_{i}", placeholder="e.g. 500mg")
-                with mc3:
-                    mfreq = st.text_input("Frequency", key=f"mfreq_{i}", placeholder="e.g. 3x daily")
-                with mc4:
-                    mdur  = st.text_input("Duration",  key=f"mdur_{i}",  placeholder="e.g. 7 days")
-                mnotes = st.text_input("Notes", key=f"mnotes_{i}", placeholder="Take after meals")
-                if mname:
-                    meds_to_save.append({
-                        "medication_name": mname, "dosage": mdose,
-                        "frequency": mfreq, "duration": mdur, "notes": mnotes,
-                    })
-
-            if st.button("💊 Save Prescriptions", key="btn_rx"):
-                if meds_to_save:
-                    add_prescription(visit_id, patient_id, doc["id"], meds_to_save)
-                    st.success(f"Saved {len(meds_to_save)} prescription(s).")
-                else:
-                    st.warning("Enter at least one medication name.")
-
-        st.markdown(f"#### 📋 Medical history — {p_name}")
-        hist = get_patient_history(patient_id)
-        if not hist.empty:
-            disp = hist[[
-                "visit_datetime", "visit_type", "department", "chief_complaint",
-                "asr_transcription", "symptom_top1", "symptom_top1_score",
-                "symptom_top2", "symptom_top3", "urgency", "severity_score",
-                "follow_up_needed", "doctor_name", "doctor_notes",
-            ]].copy()
-            disp.columns = [
-                "Date", "Type", "Dept", "Chief Complaint", "Transcription",
-                "Symptom 1", "Confidence", "Symptom 2", "Symptom 3",
-                "Urgency", "Severity", "Follow-up", "Doctor", "Notes",
-            ]
-            disp["Confidence"] = disp["Confidence"].apply(
-                lambda v: f"{v:.1%}" if pd.notna(v) else ""
-            )
-            st.dataframe(disp, use_container_width=True)
+    _dx = st.session_state.get("dx_result")
+    if _dx and _dx.get("doctor_id") == doc["id"]:
+        render_diagnostic_result(_dx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1312,12 +1452,14 @@ elif page == "🩻 Imaging Analysis":
     doc_upload = st.file_uploader("Upload scan image:", type=["jpg", "jpeg", "png"])
 
     if doc_upload and st.button("🚀 Run Imaging Analysis"):
+        doc_upload.seek(0)
         img = Image.open(doc_upload).convert("RGB")
 
         if "Chest" in analysis_type:
             vmodel = get_vision()
             if vmodel is None:
-                st.error("CheXNet model not available. Place best_chexnet_multimodal.pth next to app.py.")
+                st.error("Chest X-ray model could not be loaded. Check the weights file / Hugging Face download.")
+                show_model_error("vision")
                 st.stop()
 
             with st.spinner("Running CheXNet multimodal inference + Grad-CAM++…"):
@@ -1340,25 +1482,25 @@ elif page == "🩻 Imaging Analysis":
 
             st.success(f"**Detected:** {primary_dx}")
 
-            gcam = get_gradcam()
-            if gcam is not None:
-                try:
-                    target_idx = int(np.argmax(preds))
-                    heatmap    = gcam.generate(img_tensor, meta_tensor, target_idx)
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.image(img, caption="Original X-Ray", use_container_width=True)
-                    with col2:
+            target_idx = int(np.argmax(preds))
+            col1, col2 = st.columns(2)
+            with col1:
+                show_image(img, "Original X-Ray")
+            with col2:
+                gcam = get_gradcam()
+                if gcam is None:
+                    st.warning("Grad-CAM++ is unavailable.")
+                    show_model_error("gradcam")
+                else:
+                    try:
+                        heatmap = gcam.generate(img_tensor, meta_tensor, target_idx)
                         if heatmap is not None:
                             overlay = GradCAMPlusPlus.overlay(img, heatmap, alpha=0.40)
-                            st.image(overlay,
-                                     caption=f"Grad-CAM++ · {DISEASE_LABELS[target_idx]}",
-                                     use_container_width=True)
+                            show_image(overlay, f"Grad-CAM++ · {DISEASE_LABELS[target_idx]}")
                         else:
                             st.warning("Grad-CAM++ could not generate a heatmap.")
-                except Exception as e:
-                    st.warning(f"Grad-CAM++ error: {e}")
-                    st.image(img, caption="Original X-Ray", use_container_width=True)
+                    except Exception as e:
+                        st.warning(f"Grad-CAM++ error: {e}")
 
             st.markdown("#### All Pathology Probabilities")
             prob_df = pd.DataFrame(
@@ -1371,7 +1513,7 @@ elif page == "🩻 Imaging Analysis":
                          color_continuous_scale="Blues", template="plotly_white")
             fig.add_vline(x=30, line_dash="dash", line_color="red", annotation_text="Threshold")
             fig.update_layout(height=500, coloraxis_showscale=False)
-            st.plotly_chart(fig, use_container_width=True)
+            show_plot(fig)
 
             os.makedirs(os.path.join(_HERE, "saved"), exist_ok=True)
             save_path = os.path.join(_HERE, "saved", f"dx_{pid}_{int(datetime.now().timestamp())}.png")
@@ -1388,7 +1530,8 @@ elif page == "🩻 Imaging Analysis":
         else:
             kmodel = get_kvasir()
             if kmodel is None or not _TF_AVAILABLE:
-                st.error("Kvasir model not available. Place gi_model_clean.h5 next to app.py.")
+                st.error("Kvasir model not available (model failed to load or TensorFlow is missing).")
+                show_model_error("kvasir")
                 st.stop()
 
             with st.spinner("Running Kvasir GI inference + LIME explanation…"):
@@ -1400,13 +1543,13 @@ elif page == "🩻 Imaging Analysis":
 
             col1, col2 = st.columns(2)
             with col1:
-                st.image(img, caption="Original Endoscopy Frame", use_container_width=True)
+                show_image(img, "Original Endoscopy Frame")
             with col2:
-                st.image(lime_img, caption="LIME Positive Feature Segments", use_container_width=True)
+                show_image(lime_img, "LIME Positive Feature Segments")
 
             if chart_data:
                 st.markdown("#### LIME Attribution Weights")
-                st.dataframe(pd.DataFrame(chart_data), use_container_width=True)
+                show_df(pd.DataFrame(chart_data))
 
             res_map   = {"class": class_name, "confidence": confidence, "risk_tier": "evaluated"}
             os.makedirs(os.path.join(_HERE, "saved"), exist_ok=True)
@@ -1431,7 +1574,7 @@ elif page == "🩻 Imaging Analysis":
     for r in recs:
         with st.expander(f"Record #{r['record_id']} — {r['timestamp']} ({r.get('view_position','?')})"):
             if r.get("image_path") and os.path.isfile(r["image_path"]):
-                st.image(r["image_path"], width=280)
+                show_image(r["image_path"], "", max_side=400)
             render_imaging_findings(r.get("all_findings"))
             if r.get("doctor_notes"):
                 st.info(f"**Doctor Notes:** {r['doctor_notes']}")
@@ -1503,7 +1646,7 @@ elif page == "📅 Appointments":
             lambda s: f"{STATUS_COLOR.get(s, '')} {s.capitalize()}"
         )
         display.columns = ["Date", "Time", "Patient", "Reason", "Status", "Your Note"]
-        st.dataframe(display, use_container_width=True)
+        show_df(display)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1539,16 +1682,14 @@ elif page == "📊 Insights Hub":
         st.warning("No visit data yet. Run some diagnoses first.")
         st.stop()
 
-    df["visit_datetime"] = pd.to_datetime(
-    df["visit_datetime"],
-    errors="coerce"
-)
+    df["visit_datetime"] = pd.to_datetime(df["visit_datetime"], errors="coerce")
+    df = df.dropna(subset=["visit_datetime"])
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total Patients",    df["patient_id"].nunique())
     m2.metric("Total Visits",      len(df))
     m3.metric("Avg Severity",      f"{df['severity_score'].mean():.1f}")
-    m4.metric("Follow-ups Needed", int(df["follow_up_needed"].sum()))
+    m4.metric("Follow-ups Needed", int(df["follow_up_needed"].fillna(0).sum()))
 
     c1, c2 = st.columns(2)
     with c1:
@@ -1558,7 +1699,7 @@ elif page == "📊 Insights Hub":
             color_discrete_map={"routine": "#22C55E", "soon": "#F59E0B",
                                  "urgent": "#EF4444", "emergency": "#7C3AED"},
         )
-        st.plotly_chart(fig_u, use_container_width=True)
+        show_plot(fig_u)
     with c2:
         st.markdown("#### Top Predicted Symptoms")
         s_cnt = df["symptom_top1"].value_counts().head(10).reset_index()
@@ -1566,13 +1707,13 @@ elif page == "📊 Insights Hub":
         fig_s = px.bar(s_cnt.sort_values("count"), x="count", y="symptom",
                        orientation="h", color="count", color_continuous_scale="Blues")
         fig_s.update_layout(coloraxis_showscale=False)
-        st.plotly_chart(fig_s, use_container_width=True)
+        show_plot(fig_s)
 
     st.markdown("#### Weekly Visit Volume")
     weekly = df.set_index("visit_datetime").resample("W")["visit_id"].count().reset_index()
     weekly.columns = ["week", "visits"]
     fig_v = px.area(weekly, x="week", y="visits", color_discrete_sequence=["#3b82f6"])
-    st.plotly_chart(fig_v, use_container_width=True)
+    show_plot(fig_v)
 
     st.markdown("#### Patient Risk Matrix — Age vs Severity")
     fig_r = px.scatter(
@@ -1582,14 +1723,14 @@ elif page == "📊 Insights Hub":
                              "urgent": "#EF4444", "emergency": "#7C3AED"},
         template="plotly_white",
     )
-    st.plotly_chart(fig_r, use_container_width=True)
+    show_plot(fig_r)
 
     st.markdown("#### Severity Distribution per Symptom")
     top_symp = df["symptom_top1"].value_counts().head(8).index
     fig_b    = px.box(df[df["symptom_top1"].isin(top_symp)],
                       x="symptom_top1", y="severity_score", color="symptom_top1")
     fig_b.update_layout(showlegend=False, xaxis_tickangle=-30)
-    st.plotly_chart(fig_b, use_container_width=True)
+    show_plot(fig_b)
 
     # Appointment stats
     all_appts = get_doctor_appointments(doc["id"])
@@ -1601,7 +1742,7 @@ elif page == "📊 Insights Hub":
                        color="Status",
                        color_discrete_map={"pending": "#F59E0B", "confirmed": "#22C55E",
                                            "rejected": "#EF4444", "completed": "#94A3B8"})
-        st.plotly_chart(fig_a, use_container_width=True)
+        show_plot(fig_a)
 
     # Imaging stats
     records = _fetch_all("SELECT view_position, all_findings FROM medical_records")
@@ -1631,7 +1772,7 @@ elif page == "📊 Insights Hub":
             fig_dx = px.bar(counts, x="Condition", y="count",
                             title="Frequency of Imaging Diagnoses",
                             color="count", color_continuous_scale="Blues")
-            st.plotly_chart(fig_dx, use_container_width=True)
+            show_plot(fig_dx)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1645,7 +1786,8 @@ elif page == "📋 Clinical Logs":
         st.warning("No records found.")
         st.stop()
 
-    df["visit_datetime"] = pd.to_datetime(df["visit_datetime"])
+    df["visit_datetime"] = pd.to_datetime(df["visit_datetime"], errors="coerce")
+    df = df.dropna(subset=["visit_datetime"])
 
     f1, f2, f3 = st.columns(3)
     with f1:
@@ -1659,22 +1801,22 @@ elif page == "📋 Clinical Logs":
             df["visit_datetime"].min().date(), df["visit_datetime"].max().date()
         ])
 
-    filtered = df[
-        df["urgency"].isin(urgency_filter) &
-        df["department"].isin(dept_filter) &
-        (df["visit_datetime"].dt.date >= date_range[0]) &
-        (df["visit_datetime"].dt.date <= date_range[1])
-    ] if len(date_range) == 2 else df
+    if isinstance(date_range, (list, tuple)) and len(date_range) == 2:
+        filtered = df[
+            df["urgency"].isin(urgency_filter) &
+            df["department"].isin(dept_filter) &
+            (df["visit_datetime"].dt.date >= date_range[0]) &
+            (df["visit_datetime"].dt.date <= date_range[1])
+        ]
+    else:
+        filtered = df[df["urgency"].isin(urgency_filter) & df["department"].isin(dept_filter)]
 
     st.caption(f"Showing {len(filtered)} records")
-    st.dataframe(
-        filtered[[
-            "visit_datetime", "full_name", "age", "gender",
-            "chief_complaint", "symptom_top1", "urgency",
-            "severity_score", "follow_up_needed", "doctor_name", "department",
-        ]],
-        use_container_width=True,
-    )
+    show_df(filtered[[
+        "visit_datetime", "full_name", "age", "gender",
+        "chief_complaint", "symptom_top1", "urgency",
+        "severity_score", "follow_up_needed", "doctor_name", "department",
+    ]])
     csv = filtered.to_csv(index=False).encode("utf-8")
     st.download_button("⬇️ Export CSV", csv, "clinical_logs.csv", "text/csv")
 
@@ -1721,24 +1863,18 @@ elif page == "👤 Patient Search":
                     if hist.empty:
                         st.caption("No visits recorded yet.")
                     else:
-                        st.dataframe(
-                            hist[[
-                                "visit_datetime", "chief_complaint", "symptom_top1",
-                                "urgency", "severity_score", "doctor_name", "doctor_notes",
-                            ]],
-                            use_container_width=True,
-                        )
+                        show_df(hist[[
+                            "visit_datetime", "chief_complaint", "symptom_top1",
+                            "urgency", "severity_score", "doctor_name", "doctor_notes",
+                        ]])
 
                     st.markdown("**Prescriptions:**")
                     rx = get_patient_prescriptions(p["patient_id"])
                     if rx.empty:
                         st.caption("No prescriptions on file.")
                     else:
-                        st.dataframe(
-                            rx[["medication_name", "dosage", "frequency",
-                                "duration", "issued_at", "doctor_name"]],
-                            use_container_width=True,
-                        )
+                        show_df(rx[["medication_name", "dosage", "frequency",
+                                    "duration", "issued_at", "doctor_name"]])
 
                     st.markdown("**Imaging records:**")
                     img_recs = _fetch_all(
@@ -1753,6 +1889,3 @@ elif page == "👤 Patient Search":
                             )
                     else:
                         st.caption("No imaging records.")
-                        
-                        
-                   
